@@ -264,6 +264,87 @@ def render_reserves(data, premium_uploads, members=None):
         st.warning(f"Scenario totals retain {count:,} records flagged by the validation checks.")
 
 
+def excel_paid_ratio(data, members, month, currency, clients, products):
+    m = members.copy()
+    m.columns = m.columns.astype(str).str.strip()
+    required = {"4037", "Company name", "Product name", "annual premium", "Reporting Month"}
+    if not required.issubset(m.columns):
+        raise ValueError("Membership needs member ID, client, product, annual premium and Reporting Month.")
+    ids = m["4037"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    if m["4037"].isna().any() or ids.eq("").any() or ids.duplicated().any():
+        raise ValueError("Member IDs must be present and unique.")
+    for col in ["Company name", "Product name"]:
+        if m[col].isna().any():
+            raise ValueError("Missing membership client or product.")
+        m[col] = m[col].astype(str).str.strip()
+    reporting = pd.to_datetime(m["Reporting Month"], errors="coerce").dt.strftime("%Y-%m")
+    if reporting.isna().any() or not reporting.eq(month).all():
+        raise ValueError("The membership snapshot must have Reporting Month equal to the selected processing month. Upload the matching snapshot.")
+    m["annual premium"] = clean_amounts(m["annual premium"])
+    if not m["annual premium"].map(lambda x: pd.notna(x) and 0 <= x < float("inf")).all():
+        raise ValueError("Annual premiums must be valid nonnegative numbers.")
+    m = m[m["Company name"].isin(clients) & m["Product name"].isin(products)]
+    c = data[data["CLIENTS"].isin(clients) & data["SCHEME_NAME"].isin(products) & data["CLAIM_CURRECY"].str.upper().eq(currency) & data["CLAIM_PROCESSED_DATE"].dt.strftime("%Y-%m").eq(month)].copy()
+    if c["AMOUNT_AGREED"].isna().any():
+        raise ValueError("Invalid paid amounts in the selected processing month.")
+    pre = m.groupby(["Company name", "Product name"])["annual premium"].sum().div(12).rename("Fictional monthly premium").reset_index().rename(columns={"Company name":"Client", "Product name":"Product"})
+    paid = c.groupby(["CLIENTS", "SCHEME_NAME"])["AMOUNT_AGREED"].sum().rename("Paid claims").reset_index().rename(columns={"CLIENTS":"Client", "SCHEME_NAME":"Product"})
+    result = pre.merge(paid, on=["Client", "Product"], how="outer", validate="one_to_one")
+    result["Paid claims"] = result["Paid claims"].fillna(0)
+    result["Paid claims ratio (%)"] = result["Paid claims"] / result["Fictional monthly premium"].replace(0,float("nan")) * 100
+    return result, c
+
+
+def render_excel_ratio(data, members):
+    st.subheader("Paid claims ratio · Excel basis")
+    st.info("Fictional premiums calibrated in Excel to a 75% August paid-claims ratio. The ratio below is calculated from the uploaded values, not forced to 75%.")
+    st.caption("Processing-month basis: every listed member contributes annual premium ÷ 12 for the reporting month. Joining and expiry dates are not prorated. This matches the updated workbook's assumptions; it is not an incurred or ultimate loss ratio.")
+    if members is None or "annual premium" not in members.columns:
+        st.info("Select the updated membership workbook containing annual premium.")
+        return
+
+    months = sorted(data["CLAIM_PROCESSED_DATE"].dropna().dt.strftime("%Y-%m").unique().tolist())
+    if not months:
+        st.error("Valid processing dates are required.")
+        return
+    x,y=st.columns(2)
+    month=x.selectbox("Processing month",months,index=len(months)-1,key="excel_month")
+    currencies=sorted(data["CLAIM_CURRECY"].str.upper().unique().tolist())
+    currency=y.selectbox("Annual premium currency · Excel assumption",currencies,index=currencies.index("USD") if "USD" in currencies else 0,key="excel_currency")
+    st.caption("The updated workbook specifies USD in Premium assumptions. This selector assigns the membership rates to one currency; no currency conversion is performed.")
+    clients=sorted(set(data["CLIENTS"]) | set(members["Company name"].dropna().astype(str).str.strip()))
+    selected=st.multiselect("Clients · Excel basis",clients,default=clients,key="excel_clients")
+    products=sorted(set(data.loc[data["CLIENTS"].isin(selected),"SCHEME_NAME"]) | set(members.loc[members["Company name"].isin(selected),"Product name"].dropna().astype(str).str.strip()))
+    selected_p=st.multiselect("Products · Excel basis",products,default=products,key="excel_products")
+    st.caption("These controls apply only to this view; sidebar treatment-month and claim-type filters do not apply.")
+    if not selected or not selected_p:
+        st.info("Select at least one client and product.")
+        return
+    try:
+        result,scoped=excel_paid_ratio(data,members,month,currency,selected,selected_p)
+    except ValueError as exc:
+        st.error(str(exc));return
+    missing=result["Fictional monthly premium"].isna().any()
+    premium=result["Fictional monthly premium"].sum()
+    paid=result["Paid claims"].sum()
+    if missing:
+        st.error("Claims have a client/product with no matching premium. Overall premium and ratio are withheld.")
+    x,y,z=st.columns(3)
+    x.metric("Paid claims · "+currency,f"{paid:,.2f}")
+    y.metric("Fictional monthly premium · "+currency,"Incomplete" if missing else f"{premium:,.2f}")
+    z.metric("Paid claims ratio · Excel basis",f"{paid/premium:.2%}" if not missing and premium>0 else "N/A")
+    summary=result.groupby("Client")[["Paid claims","Fictional monthly premium"]].sum()
+    incomplete=result.groupby("Client")["Fictional monthly premium"].apply(lambda v:v.isna().any())
+    summary.loc[incomplete,"Fictional monthly premium"]=float("nan")
+    summary["Paid claims ratio (%)"]=summary["Paid claims"]/summary["Fictional monthly premium"].replace(0,float("nan"))*100
+    st.dataframe(summary.round(2))
+    st.bar_chart(summary[["Paid claims","Fictional monthly premium"]])
+    with st.expander("Product detail"):
+        st.dataframe(result.round(2),hide_index=True)
+    st.caption("All supplied paid amounts are retained, including deliberate payment errors and unmatched members assigned by client. No under-review amounts or reserve loading are added. Changing claims without updating the fictional premiums can change the ratio.")
+    st.write("For the treatment-period reserve scenario, open the separate Reserves & loss ratio tab. Its date proration and incurred-period scope intentionally produce different results.")
+
+
 def main():
     st.set_page_config(page_title=TITLE, page_icon="📊", layout="wide")
     st.markdown("""<style>
@@ -272,7 +353,7 @@ def main():
     [data-testid="stMetric"] {background:white;padding:20px;border-radius:12px;border:1px solid #e0e7f0;}
     </style>""", unsafe_allow_html=True)
     st.title(TITLE)
-    st.caption("Version 0.5 · Claims overview · Reserves & loss ratio · Payment checks")
+    st.caption("Version 0.6 · Claims overview · Reserves & loss ratio · Payment checks")
     st.info("Local prototype for fictional data. Online sign-in and user permissions are not configured yet.")
     upload = st.sidebar.file_uploader("Open paid claims workbook", type=["xlsx"])
     member_upload = st.sidebar.file_uploader("Open membership workbook (optional)", type=["xlsx"])
@@ -325,7 +406,9 @@ def main():
     lag = filtered.loc[filtered["Processing lag (days)"] >= 0, "Processing lag (days)"].median()
     cards[3].metric("Median processing lag", "Unavailable" if pd.isna(lag) else f"{lag:,.0f} days")
     st.caption("Totals retain source payment exceptions. Missing amounts are excluded from sums and flagged. Lag measures treatment to processing, not provider submission time.")
-    overview, reserves, checks, membership_tab, pipeline, details = st.tabs(["Overview", "Reserves & loss ratio", "Payment checks", "Membership", "Under review", "About the data"])
+    overview, excel_ratio, reserves, checks, membership_tab, pipeline, details = st.tabs(["Overview", "Paid ratio · Excel basis", "Reserves & loss ratio", "Payment checks", "Membership", "Under review", "About the data"])
+    with excel_ratio:
+        render_excel_ratio(data, members)
     with reserves:
         render_reserves(data, [("Paid claims workbook", upload), ("Membership workbook", member_upload), ("Under-review workbook", review_upload), ("Separate premium workbook", premium_upload)], members)
     with overview:
